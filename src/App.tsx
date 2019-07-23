@@ -10,6 +10,7 @@ import { Map } from './components/Map';
 import { Navigator } from './components/Navigator';
 import { EditingTools } from './components/EditingTools';
 import { Toolbox } from './components/Toolbox';
+import { Modal } from './components/PropertyWindow/EditPropertyWindow';
 
 import { EmitterFactory } from "./exporter/factory";
 
@@ -70,6 +71,7 @@ export class App extends React.Component<AppProps, AppState> {
                     <Navigator />
                     <EditingTools />
                     <Toolbox />
+                    <Modal />
                 </div>
                 <div className="main">
                     <Map tool={MapTools.Pan}/>

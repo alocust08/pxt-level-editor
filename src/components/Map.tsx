@@ -1,28 +1,39 @@
 import * as React from 'react';
-import '../css/map.css';
 import { ClientCoordinates, GestureTarget, bindGestureEvents, loadImageAsync, Bitmask } from '../util';
 import { TILE_SIZE, TileSet } from '../tileset';
-import { MapTools } from '../util';
-import { MapRect, MapData, MapObject, MapArea, overlaps, MapObjectLayers } from '../map';
+import { MapRect, MapData, MapObject, MapArea, overlaps, MapObjectLayers, MapLog, ReadonlyMapData, MapOperation, SetTileOp, SetMultiTileOp } from '../map';
+import { MapTools, pointerEvents, clientCoord } from '../util';
+import { Tile } from './Toolbox/toolboxTypes';
+
+import '../css/map.css';
 
 export interface MapProps {
+    tileSelected: Tile;
     tool: MapTools;
-    map: MapData;
+    map: MapLog;
     activeLayer: MapObjectLayers;
-    tileSet: TileSet
+    tileSet: TileSet;
+    onRectChange: (rect: MapRect) => void;
 }
 
-export class Map extends React.Component<MapProps, {}> {
+export interface MapState {
+    canvasCoordinates: Array<number>;
+}
+
+export class Map extends React.Component<MapProps, MapState> {
     protected workspace: MapCanvas;
 
     constructor(props: MapProps) {
         super(props);
+        this.state = {canvasCoordinates:[0,0]}
+        addEventListener(pointerEvents.move,this.handleCoordinates.bind(this));
     }
 
     render() {
         return (
             <div className="map">
                 <canvas ref={this.handleCanvasRef} />
+                <div className="coordinate">{this.state.canvasCoordinates[0]},{this.state.canvasCoordinates[1]}</div>
                 <div className="zoom">
                     <span ref="minus" className="fas fa-minus-square fa-lg" onClick={(event) => this.workspace.zoomIn(false)}></span>
                     <span ref="plus" className="fas fa-plus-square fa-lg" onClick={(event) => this.workspace.zoomIn(true)}></span>
@@ -33,6 +44,9 @@ export class Map extends React.Component<MapProps, {}> {
 
     componentDidMount() {
         window.addEventListener("resize", this.handleResize);
+        window.addEventListener("keyup", this.handleKeyup);
+
+        this.workspace.setOnRectChange(this.props.onRectChange);
     }
 
     componentWillUnmount() {
@@ -54,6 +68,19 @@ export class Map extends React.Component<MapProps, {}> {
     handleResize = () => {
         window.requestAnimationFrame(() => this.workspace.resize());
     }
+
+    handleCoordinates(){
+        if (this.workspace)
+        this.setState({canvasCoordinates: this.workspace.getCanvasCoordinates()})
+    }
+    handleKeyup = (e: KeyboardEvent) => {
+        // TODO: add visual undo/redo buttons
+        if (e.code == "KeyZ" && (e.ctrlKey || e.metaKey)) {
+            this.workspace.undo()
+        } else if (e.code == "KeyR" && e.ctrlKey) {
+            this.workspace.redo()
+        }
+    }
 }
 
 export class MapCanvas implements GestureTarget {
@@ -67,6 +94,8 @@ export class MapCanvas implements GestureTarget {
 
     protected offsetX = 0;
     protected offsetY = 0;
+    protected mouseX: number = null;
+    protected mouseY: number = null;
 
     protected context: CanvasRenderingContext2D;
     protected cachedBounds: ClientRect;
@@ -74,20 +103,31 @@ export class MapCanvas implements GestureTarget {
     protected dragLast: ClientCoordinates;
 
     protected bitmask: Bitmask;
+    protected canvasCoordinates: Array<number> = [0,0];
 
-    constructor(protected canvas: HTMLCanvasElement, protected map: MapData, protected tileSet: TileSet) {
+    protected onRectChange: (rect: MapRect) => void;
+
+    constructor(protected canvas: HTMLCanvasElement, protected log: MapLog, protected tileSet: TileSet) {
         this.context = canvas.getContext("2d");
+        this.log.addChangeListener(() => this.redraw())
 
         this.resize();
         bindGestureEvents(canvas, this);
-
-        this.map.addChangeListener(() => this.redraw());
-        this.map.addObjectToLayer(MapObjectLayers.Decoration, new MapObject(1, 1));
-
+        canvas.addEventListener(pointerEvents.move, this.onMouseMove.bind(this));
+        canvas.addEventListener(pointerEvents.leave, this.onMouseLeave.bind(this));
     }
 
-    setTileSet(tiles: TileSet){
-        this.tileSet=tiles;
+    map(): ReadonlyMapData {
+        return this.log.currentState()
+    }
+
+    setTileSet(tiles: TileSet) {
+        // TODO(dz): handle undo/redo?
+        this.tileSet = tiles;
+    }
+
+    setOnRectChange(cb: (rect: MapRect) => void) {
+        this.onRectChange = cb;
     }
 
     centerOnTile(x: number, y: number) {
@@ -119,7 +159,14 @@ export class MapCanvas implements GestureTarget {
                                 break;
                         }
                     } else {
-                        this.drawTile(left, top, this.map.getTile(c, r));
+                        this.drawTile(left, top, this.map().getTile(c, r));
+                    }
+
+                    if (this.mouseX === c && this.mouseY === r) {
+                        this.context.fillStyle = "#5a5a5a"
+                        this.context.globalAlpha = 0.5;
+                        this.context.fillRect(left, top, TILE_SIZE * this.zoomMultiplier, TILE_SIZE * this.zoomMultiplier);
+                        this.context.globalAlpha = 1;
                     }
                 }
             }
@@ -162,20 +209,64 @@ export class MapCanvas implements GestureTarget {
         }
     }
 
+    private triggerOperation(op: MapOperation) {
+        this.log.do(op)
+    }
+
+    static applyOperation(state: MapData, op: MapOperation): MapData {
+        if (op.kind === "settile") {
+            state.setTile(op.row, op.col, op.data);
+        } else if (op.kind === "setobj") {
+            state.addObjectToLayer(op.layer, op.obj)
+        } else if (op.kind === "multitile") {
+            for (let c = 0; c < op.bitmask.width; c++) {
+                for (let r = 0; r < op.bitmask.height; r++) {
+                    if (op.bitmask.get(c, r) === 1) {
+                        state.setTile(c + op.offsetX, r + op.offsetY, op.data);
+                    }
+                }
+            }
+        } else {
+            let _: never = op
+        }
+        return state
+    }
+
+    undo() {
+        this.log.undo()
+    }
+
+    redo() {
+        this.log.redo()
+    }
+
     updateActiveLayer(layer: MapObjectLayers) {
         this.activeLayer = layer;
     }
 
     onClick(coord: ClientCoordinates) {
-        coord = this.clientToCanvas(coord);
-
+        const canvasCoords = this.clientToCanvas(coord);
+        let data = null
+        let mapUpdate = false
         switch (this.tool) {
             case MapTools.Stamp:
-                this.map.setTile(this.canvasToMap(coord.clientX - this.offsetX), this.canvasToMap(coord.clientY - this.offsetY), 1);
+                data = 1
+                mapUpdate = true
                 break;
             case MapTools.Erase:
-                this.map.setTile(this.canvasToMap(coord.clientX - this.offsetX), this.canvasToMap(coord.clientY - this.offsetY), null);
+                data = null
+                mapUpdate = true
                 break;
+        }
+
+        if (mapUpdate) {
+            let op: SetTileOp = {
+                kind: "settile",
+                row: this.canvasToMap(canvasCoords.clientX - this.offsetX),
+                col: this.canvasToMap(canvasCoords.clientY - this.offsetY),
+                data,
+            }
+            this.triggerOperation(op)
         }
     }
 
@@ -197,7 +288,9 @@ export class MapCanvas implements GestureTarget {
             switch (this.tool) {
                 case MapTools.Stamp:
                 case MapTools.Erase:
-                    this.bitmask.set(this.canvasToMap(canvasCoords.clientX - this.offsetX) + this.canvasToFullMap(this.offsetX), this.canvasToMap(canvasCoords.clientY - this.offsetY) + this.canvasToFullMap(this.offsetY));
+                    const c = this.canvasToMap(canvasCoords.clientX - this.offsetX) + this.canvasToFullMap(this.offsetX);
+                    const r = this.canvasToMap(canvasCoords.clientY - this.offsetY) + this.canvasToFullMap(this.offsetY);
+                    if (c >= 0 && c < this.bitmask.width && r >= 0 && r < this.bitmask.height) this.bitmask.set(c, r);
                     break;
             }
         }
@@ -212,19 +305,27 @@ export class MapCanvas implements GestureTarget {
 
         // Applies the bitmask based on the current tool
         if (this.bitmask) {
-            for (let c = 0; c <= this.bitmask.width; c++) {
-                for (let r = 0; r <= this.bitmask.height; r ++) {
-                    if (this.bitmask.get(c, r) === 1) {
-                        switch (this.tool) {
-                            case MapTools.Stamp:
-                                this.map.setTile(c + this.canvasToMap(-this.offsetX), r + this.canvasToMap(-this.offsetY), 1);
-                                break;
-                            case MapTools.Erase:
-                                this.map.setTile(c + this.canvasToMap(-this.offsetX), r + this.canvasToMap(-this.offsetY), null);
-                                break;
-                        }
-                    }
+            let data: number | null;
+            let mapUpdate = false
+            switch (this.tool) {
+                case MapTools.Stamp:
+                    data = 1
+                    mapUpdate = true
+                    break;
+                case MapTools.Erase:
+                    data = null
+                    mapUpdate = true
+                    break;
+            }
+            if (mapUpdate) {
+                let op: SetMultiTileOp = {
+                    kind: "multitile",
+                    bitmask: this.bitmask,
+                    offsetX: this.canvasToMap(-this.offsetX),
+                    offsetY: this.canvasToMap(-this.offsetY),
+                    data: data
                 }
+                this.triggerOperation(op)
             }
             this.bitmask = null;
         }
@@ -232,8 +333,35 @@ export class MapCanvas implements GestureTarget {
         this.dragLast = undefined;
     }
 
-    zoomIn(isZoomIn: boolean){
+    onMouseEnter(evt: PointerEvent) {
+        this.onMouseMove(evt);
 
+        this.redraw();
+    }
+
+    onMouseMove(evt: PointerEvent) {
+        const coord = clientCoord(evt);
+        const canvasCoords = this.clientToCanvas(coord);
+
+        this.mouseX = this.canvasToMap(canvasCoords.clientX - this.offsetX);
+        this.mouseY = this.canvasToMap(canvasCoords.clientY - this.offsetY);
+        this.canvasCoordinates = [this.mouseX,this.mouseY];
+
+        this.redraw();
+    }
+
+    onMouseLeave(evt: PointerEvent) {
+        this.mouseX = null;
+        this.mouseY = null;
+
+        this.redraw();
+    }
+
+    getCanvasCoordinates(): Array<number> {
+        return this.canvasCoordinates;
+    }
+
+    zoomIn(isZoomIn: boolean) {
         let currentZoomAmount = isZoomIn ? this.amountToZoom : -1 * this.amountToZoom;
         this.zoomMultiplier += currentZoomAmount;
 
@@ -258,8 +386,8 @@ export class MapCanvas implements GestureTarget {
         }
     }
 
-    protected visibleRect(): MapRect {
-        return {
+    visibleRect(): MapRect {
+        let rect = {
             left: this.canvasToMap(-this.offsetX) - 1,
             top: this.canvasToMap(-this.offsetY) - 1,
             right: this.canvasToMap(-this.offsetX + this.cachedBounds.width) + 1,
@@ -267,10 +395,13 @@ export class MapCanvas implements GestureTarget {
             width: this.canvasToFullMap(this.cachedBounds.width) + 1,
             height: this.canvasToFullMap(this.cachedBounds.height) + 1
         }
+
+        this.onRectChange(rect);
+        return rect;
     }
 
     protected drawObjectLayers(bounds: MapRect) {
-        for (const layer of this.map.getLayers()) {
+        for (const layer of this.map().getLayers()) {
             const objects = layer.getObjects().filter(o => overlaps(bounds, o));
 
             for (const obj of objects) {
